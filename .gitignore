@@ -12,3 +12,4 @@ ai/.env
 test/*
 .idea/
 .cursorrules
+.env

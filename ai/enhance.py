@@ -3,9 +3,7 @@ import json
 import sys
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
-from queue import Queue
-from threading import Lock
+from typing import List, Dict, Any, Optional
 # INSERT_YOUR_CODE
 import requests
 
@@ -22,10 +20,33 @@ from langchain.prompts import (
 )
 from structure import Structure
 
-if os.path.exists('.env'):
-    dotenv.load_dotenv()
+def load_env():
+    env_candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+    ]
+    loaded = set()
+    for env_path in env_candidates:
+        if env_path in loaded:
+            continue
+        if os.path.exists(env_path):
+            dotenv.load_dotenv(env_path)
+            loaded.add(env_path)
+
+
+load_env()
 template = open("template.txt", "r").read()
 system = open("system.txt", "r").read()
+
+REQUIRED_AI_FIELDS = ("tldr", "motivation", "method", "result", "conclusion")
+DEFAULT_AI_FIELDS = {
+    "tldr": "Summary generation failed",
+    "motivation": "Motivation analysis unavailable",
+    "method": "Method extraction failed",
+    "result": "Result analysis unavailable",
+    "conclusion": "Conclusion extraction failed",
+}
 
 def parse_args():
     """解析命令行参数"""
@@ -34,12 +55,82 @@ def parse_args():
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
-def process_single_item(chain, item: Dict, language: str) -> Dict:
+
+def _normalize_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+        return "\n".join(chunks)
+    return str(content)
+
+
+def _extract_json_candidate(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return None
+
+
+def _fallback_request(content: str, language: str, model_name: str) -> Optional[str]:
+    """Bypass langchain and call API directly to avoid proxy tool injection."""
+    prompt = (
+        system.replace("{language}", language)
+        + "\n\n"
+        + template.replace("{content}", content).replace("{language}", language)
+        + "\n\nReturn ONLY a valid JSON object with keys: "
+        + ", ".join(REQUIRED_AI_FIELDS)
+        + "."
+    )
+    resp = requests.post(
+        os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+        headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"], "Content-Type": "application/json"},
+        json={
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": [],
+            "tool_choice": "none",
+        },
+        timeout=60,
+    )
+    if resp.status_code == 200:
+        return resp.json()["choices"][0]["message"].get("content", "")
+    return None
+
+
+def _coerce_ai_fields(raw_data: Dict[str, Any]) -> Dict[str, str]:
+    cleaned: Dict[str, str] = {}
+    for field in REQUIRED_AI_FIELDS:
+        if field in raw_data:
+            value = raw_data[field]
+            cleaned[field] = value if isinstance(value, str) else str(value)
+    return cleaned
+
+def process_single_item(structured_chain, model_name: str, item: Dict, language: str) -> Dict:
     def is_sensitive(content: str) -> bool:
         """
         调用 spam.dw-dengwei.workers.dev 接口检测内容是否包含敏感词。
         返回 True 表示触发敏感词，False 表示未触发。
         """
+        if not content:
+            return False
         try:
             resp = requests.post(
                 "https://spam.dw-dengwei.workers.dev",
@@ -51,12 +142,13 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
                 # 约定接口返回 {"sensitive": true/false, ...}
                 return result.get("sensitive", True)
             else:
-                # 如果接口异常，默认不触发敏感词
+                # 接口异常时默认放行，避免整批数据被误杀
                 print(f"Sensitive check failed with status {resp.status_code}", file=sys.stderr)
-                return True
+                return False
         except Exception as e:
             print(f"Sensitive check error: {e}", file=sys.stderr)
-            return True
+            # 网络/服务异常时默认放行，避免整批数据被误杀
+            return False
 
     def check_github_code(content: str) -> Dict:
         """提取并验证 GitHub 链接"""
@@ -115,25 +207,22 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         item.update(code_info)
 
     """处理单个数据项"""
-    # Default structure with meaningful fallback values
-    default_ai_fields = {
-        "tldr": "Summary generation failed",
-        "motivation": "Motivation analysis unavailable",
-        "method": "Method extraction failed",
-        "result": "Result analysis unavailable",
-        "conclusion": "Conclusion extraction failed"
-    }
-    
+    ai_data: Dict[str, str] = {}
+
     try:
-        response: Structure = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
-        item['AI'] = response.model_dump()
+        if structured_chain is not None:
+            response: Structure = structured_chain.invoke({
+                "language": language,
+                "content": item['summary']
+            })
+            if hasattr(response, "model_dump"):
+                ai_data = _coerce_ai_fields(response.model_dump())
+            elif isinstance(response, dict):
+                ai_data = _coerce_ai_fields(response)
     except langchain_core.exceptions.OutputParserException as e:
         # 尝试从错误信息中提取 JSON 字符串并修复
         error_msg = str(e)
-        partial_data = {}
+        partial_data: Dict[str, Any] = {}
         
         if "Function Structure arguments:" in error_msg:
             try:
@@ -146,18 +235,26 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             except Exception as json_e:
                 print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
         
-        # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
+        ai_data = _coerce_ai_fields(partial_data)
         print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
     except Exception as e:
-        # Catch any other exceptions and provide default values
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
-    
-    # Final validation to ensure all required fields exist
-    for field in default_ai_fields.keys():
-        if field not in item['AI']:
-            item['AI'][field] = default_ai_fields[field]
+        print(f"Structured generation failed for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+
+    if not ai_data:
+        try:
+            raw_text = _fallback_request(item['summary'], language, model_name)
+            if raw_text:
+                candidate = _extract_json_candidate(raw_text)
+                if candidate:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        ai_data = _coerce_ai_fields(parsed)
+            if not ai_data:
+                print(f"Fallback JSON parse failed for {item.get('id', 'unknown')}", file=sys.stderr)
+        except Exception as e:
+            print(f"Fallback generation failed for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+
+    item['AI'] = {**DEFAULT_AI_FIELDS, **ai_data}
 
     # 检查 AI 生成的所有字段
     for v in item.get("AI", {}).values():
@@ -167,22 +264,35 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
-    llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
+    llm = ChatOpenAI(model=model_name)
+    structured_method = os.environ.get("STRUCTURED_OUTPUT_METHOD", "auto").strip()
+    structured_llm = None
+    try:
+        if structured_method and structured_method.lower() != "auto":
+            structured_llm = llm.with_structured_output(Structure, method=structured_method)
+        else:
+            structured_llm = llm.with_structured_output(Structure)
+    except Exception as e:
+        print(f"Failed to initialize structured output ({structured_method or 'auto'}): {e}", file=sys.stderr)
+
     print('Connect to:', model_name, file=sys.stderr)
-    
+    print(f"Structured method: {structured_method}", file=sys.stderr)
+
+    # Merge system prompt into human message to avoid proxy tool injection on SystemMessage
+    combined_template = system + "\n\n" + template
+
     prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
+        HumanMessagePromptTemplate.from_template(template=combined_template)
     ])
 
-    chain = prompt_template | llm
+    structured_chain = prompt_template | structured_llm if structured_llm is not None else None
     
     # 使用线程池并行处理
     processed_data = [None] * len(data)  # 预分配结果列表
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
+            executor.submit(process_single_item, structured_chain, model_name, item, language): idx
             for idx, item in enumerate(data)
         }
         
@@ -200,13 +310,7 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Add default AI fields to ensure consistency
                 processed_data[idx] = data[idx]
-                processed_data[idx]['AI'] = {
-                    "tldr": "Processing failed",
-                    "motivation": "Processing failed",
-                    "method": "Processing failed",
-                    "result": "Processing failed",
-                    "conclusion": "Processing failed"
-                }
+                processed_data[idx]['AI'] = DEFAULT_AI_FIELDS.copy()
     
     return processed_data
 
@@ -245,6 +349,13 @@ def main():
         language,
         args.max_workers
     )
+
+    kept_items = [item for item in processed_data if item is not None]
+    if kept_items and all(item.get("AI") == DEFAULT_AI_FIELDS for item in kept_items):
+        raise RuntimeError(
+            "AI enhancement failed for all items. "
+            "Please verify MODEL_NAME / OPENAI_BASE_URL / API compatibility."
+        )
     
     # 保存结果
     with open(target_file, "w") as f:
